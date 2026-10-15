@@ -186,6 +186,67 @@ def merge_results(*lists: list[dict]) -> list[dict]:
     return merged
 
 
+# --- Filter relevansi: pastikan berita benar-benar memuat keyword ---
+def parse_keyword(q: str):
+    """Ubah keyword gaya Google jadi aturan.
+    Hasil: (clauses, excludes). clauses = daftar syarat AND, tiap syarat = daftar alternatif (OR).
+    Contoh: '"OJK" asuransi OR reasuransi -kripto'
+      -> clauses [["ojk"], ["asuransi", "reasuransi"]], excludes ["kripto"]"""
+    tokens = re.findall(r'-?"[^"]+"|\S+', q)
+    clauses, excludes, join_next = [], [], False
+    for tok in tokens:
+        if tok.upper() == "OR" or tok == "|":
+            join_next = bool(clauses)
+            continue
+        neg = tok.startswith("-") and len(tok) > 1
+        term = tok[1:] if neg else tok
+        term = term.strip('"').lower().strip()
+        if not term or ":" in term:  # abaikan operator seperti site:
+            continue
+        if neg:
+            excludes.append(term)
+        elif join_next:
+            clauses[-1].append(term)
+        else:
+            clauses.append([term])
+        join_next = False
+    return clauses, excludes
+
+
+def term_pattern(term: str) -> re.Pattern:
+    words = [re.escape(w) for w in re.split(r"\W+", term) if w]
+    # kata dalam frasa boleh dipisah spasi/tanda baca; pakai batas kata
+    return re.compile(r"(?<!\w)" + r"[\W_]+".join(words) + r"(?!\w)", re.IGNORECASE)
+
+
+def matches_keyword(text: str, clauses, excludes) -> bool:
+    if any(term_pattern(t).search(text) for t in excludes):
+        return False
+    return all(any(term_pattern(t).search(text) for t in alts) for alts in clauses)
+
+
+def filter_relevant(articles, keyword, check_fulltext=False, max_check=60):
+    clauses, excludes = parse_keyword(keyword)
+    if not clauses:
+        return articles, []
+    keep, drop = [], []
+    for a in articles:
+        (keep if matches_keyword(f"{a['judul']} {a['cuplikan']}", clauses, excludes) else drop).append(a)
+    # Opsional: cek isi artikel untuk yang tidak lolos di judul/cuplikan
+    if check_fulltext and FULLTEXT_AVAILABLE and drop:
+        to_check, rest = drop[:max_check], drop[max_check:]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            bodies = list(pool.map(lambda a: fetch_fulltext(a["link"]), to_check))
+        drop = rest
+        for a, body in zip(to_check, bodies):
+            if body and matches_keyword(f"{a['judul']} {body}", clauses, excludes):
+                keep.append(dict(a, isi=body))
+            else:
+                drop.append(a)
+        keep.sort(key=lambda r: r["tanggal"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return keep, drop
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fulltext(gnews_url: str) -> str:
     """Coba ambil isi artikel asli (best effort, boleh gagal)."""
@@ -259,30 +320,40 @@ def get_secret(name: str) -> str:
 secret_key = get_secret("ANTHROPIC_API_KEY")
 serper_secret = get_secret("SERPER_API_KEY")
 
-with st.sidebar:
-    st.header("Pengaturan")
-    api_key = secret_key or st.text_input("Anthropic API key", type="password",
-                                          help="Diperlukan untuk fitur ringkasan.")
-    st.subheader("Sumber berita")
-    serper_key = serper_secret or st.text_input(
-        "Serper API key (opsional)", type="password",
-        help="Tambahkan hasil Google Search (web + tab News). Kosongkan untuk hanya Google News.")
-    use_serper = st.checkbox("Sertakan Google Search", value=bool(serper_key), disabled=not serper_key)
-    serper_pages = st.slider("Halaman Google Search", 1, 10, 5, disabled=not use_serper,
-                             help="1 halaman = 10 hasil = 1 kredit Serper, untuk web dan news masing-masing.")
-    model = st.text_input("Model", value=DEFAULT_MODEL)
-    lang = st.selectbox("Edisi berita", ["Indonesia", "Internasional (English)"])
-    max_articles = st.slider("Maks. artikel diringkas", 5, 50, 25)
-    use_fulltext = st.checkbox(
-        "Ambil isi artikel lengkap (lebih akurat, lebih lambat)",
-        value=False, disabled=not FULLTEXT_AVAILABLE,
-    )
-
 keyword = st.text_input("Keyword", placeholder='mis. "Bank Indonesia" suku bunga')
 c1, c2 = st.columns(2)
 today = date.today()
 start = c1.date_input("Dari tanggal", value=today - timedelta(days=7), max_value=today)
 end = c2.date_input("Sampai tanggal", value=today, max_value=today)
+
+# Pengaturan di halaman utama (sidebar tersembunyi di HP)
+with st.expander("⚙️ Pengaturan sumber & ringkasan", expanded=False):
+    serper_key = serper_secret or st.text_input(
+        "Serper API key (opsional)", type="password",
+        help="Tambahkan hasil Google Search (web + tab News).")
+    api_key = secret_key or st.text_input("Anthropic API key", type="password",
+                                          help="Diperlukan untuk fitur ringkasan.")
+    serper_pages = st.slider("Halaman Google Search", 1, 10, 5,
+                             help="1 halaman = 10 hasil = 1 kredit Serper, untuk web dan news masing-masing.")
+    lang = st.selectbox("Edisi Google News", ["Indonesia", "Internasional (English)"])
+    max_articles = st.slider("Maks. artikel diringkas", 5, 50, 25)
+    use_fulltext = st.checkbox(
+        "Ambil isi artikel lengkap (lebih akurat, lebih lambat)",
+        value=False, disabled=not FULLTEXT_AVAILABLE,
+    )
+    model = st.text_input("Model", value=DEFAULT_MODEL)
+
+use_serper = st.toggle("Sertakan Google Search (Serper)", value=bool(serper_key), disabled=not serper_key)
+strict = st.toggle("Hanya berita yang memuat keyword", value=True,
+                   help="Buang hasil yang keyword-nya tidak muncul di judul atau cuplikan.")
+deep_check = st.toggle("Cek juga isi artikel (lebih lambat)", value=False,
+                       disabled=not (strict and FULLTEXT_AVAILABLE),
+                       help="Berita yang keyword-nya hanya ada di badan artikel tetap ikut. Maks. 60 artikel dicek.")
+st.caption(
+    ("✅ Serper aktif" if serper_key else "⚪ Serper belum diisi")
+    + " · "
+    + ("✅ Ringkasan aktif" if api_key else "⚪ Ringkasan belum aktif (API key Anthropic kosong)")
+)
 
 if st.button("🔍 Cari berita", type="primary", use_container_width=True):
     if not keyword.strip():
@@ -307,16 +378,28 @@ if st.button("🔍 Cari berita", type="primary", use_container_width=True):
                 serper = search_serper(keyword.strip(), start, end, serper_key, serper_pages)
             except Exception as ex:
                 st.error(f"Gagal mengambil Google Search: {ex}")
-    st.session_state.articles = merge_results(gnews, serper)
+    merged = merge_results(gnews, serper)
+    filtered_out = []
+    if strict:
+        with st.spinner("Menyaring berita yang memuat keyword..."):
+            merged, filtered_out = filter_relevant(merged, keyword.strip(), check_fulltext=deep_check)
+    st.session_state.articles = merged
+    st.session_state.filtered_out = filtered_out
     st.session_state.meta = (keyword.strip(), start, end)
     st.session_state.summary = None
 
 articles = st.session_state.get("articles")
 if articles is not None:
     kw, s, e = st.session_state.meta
+    filtered_out = st.session_state.get("filtered_out", [])
     if not articles:
-        st.info("Tidak ada berita ditemukan untuk keyword dan periode ini.")
+        st.info("Tidak ada berita yang memuat keyword ini pada periode tersebut."
+                + (f" ({len(filtered_out)} hasil Google disaring; matikan filter untuk melihatnya.)"
+                   if filtered_out else ""))
         st.stop()
+    if filtered_out:
+        st.caption(f"🧹 {len(filtered_out)} hasil Google disaring karena tidak memuat keyword "
+                   "(lihat di tab Daftar berita).")
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Jumlah berita", len(articles))
@@ -327,7 +410,7 @@ if articles is not None:
 
     with tab_sum:
         if anthropic is None or not api_key:
-            st.info("Masukkan Anthropic API key di sidebar untuk membuat ringkasan.")
+            st.info("Isi Anthropic API key (di Secrets atau di Pengaturan) untuk membuat ringkasan.")
         elif st.button("Buat ringkasan", use_container_width=True):
             subset = [dict(a) for a in articles[:max_articles]]
             if use_fulltext:
@@ -350,7 +433,12 @@ if articles is not None:
         for i, a in enumerate(articles, 1):
             tgl = a["tanggal"].strftime("%d %b %Y %H:%M") if a["tanggal"] else "-"
             st.markdown(f"**{i}. [{a['judul']}]({a['link']})**  \n{a['media']} · {tgl} · _{a['sumber']}_")
-        df = pd.DataFrame(articles)
+        if filtered_out:
+            with st.expander(f"🧹 Disaring — tidak memuat keyword ({len(filtered_out)})"):
+                for a in filtered_out:
+                    tgl = a["tanggal"].strftime("%d %b %Y") if a["tanggal"] else "-"
+                    st.markdown(f"- [{a['judul']}]({a['link']}) · {a['media']} · {tgl}")
+        df = pd.DataFrame(articles).drop(columns=["isi"], errors="ignore")
         df["tanggal"] = df["tanggal"].astype(str)
         st.download_button("⬇️ Unduh daftar berita (.csv)", df.to_csv(index=False).encode("utf-8"),
                            file_name=f"berita_{kw}_{s}_{e}.csv", mime="text/csv")
