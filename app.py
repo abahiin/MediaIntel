@@ -173,14 +173,27 @@ def search_serper(keyword: str, start: date, end: date, api_key: str, pages: int
     return out
 
 
+def is_gnews(link: str) -> bool:
+    return "news.google.com" in (link or "")
+
+
 def merge_results(*lists: list[dict]) -> list[dict]:
-    merged, seen = [], set()
+    """Gabung & buang duplikat. Jika berita yang sama punya link asli dari sumber lain
+    (mis. Serper), link asli itu dipakai untuk versi Google News-nya."""
+    merged, by_key, seen_links = [], {}, set()
     for lst in lists:
         for r in lst:
             key = re.sub(r"\W+", " ", r["judul"].lower()).strip()
-            if not key or key in seen or r["link"] in seen:
+            if not key or r["link"] in seen_links:
                 continue
-            seen.update({key, r["link"]})
+            if key in by_key:
+                first = by_key[key]
+                if is_gnews(first["link"]) and not first.get("link_asli") and not is_gnews(r["link"]):
+                    first["link_asli"] = r["link"]
+                continue
+            r = dict(r)
+            by_key[key] = r
+            seen_links.add(r["link"])
             merged.append(r)
     merged.sort(key=lambda r: r["tanggal"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return merged
@@ -267,25 +280,85 @@ def filter_relevant(articles, keyword, check_fulltext=False, max_check=60):
     return keep, drop
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def resolve_url(link: str) -> str:
-    """Ubah link perantara news.google.com menjadi link asli media."""
-    if "news.google.com" not in link or not FULLTEXT_AVAILABLE:
+@st.cache_resource(show_spinner=False)
+def _link_cache() -> dict:
+    return {}  # hanya menyimpan hasil yang BERHASIL, supaya yang gagal dicoba lagi
+
+
+def resolve_url(link: str, cache: dict) -> str:
+    """Cara 2: ubah link news.google.com dengan decoder (bisa diblokir Google di server cloud)."""
+    if not is_gnews(link) or not FULLTEXT_AVAILABLE:
         return link
-    for attempt in range(2):
+    return _decode_gnews(link, cache)
+
+
+def _decode_gnews(link: str, cache: dict) -> str:
+    if link in cache:
+        return cache[link]
+    for _ in range(2):
         try:
             decoded = gnewsdecoder(link, interval=1)
             if decoded.get("status") and decoded.get("decoded_url"):
-                return decoded["decoded_url"]
+                cache[link] = decoded["decoded_url"]
+                return cache[link]
         except Exception:
             pass
         time.sleep(1)
     return link
 
 
-def resolve_all(articles: list[dict]) -> list[dict]:
+def _norm(t: str) -> str:
+    return re.sub(r"\W+", " ", (t or "").lower()).strip()
+
+
+def serper_find_link(title: str, media: str, api_key: str, cache: dict) -> str:
+    """Cara 3: cari judul berita di Google Search untuk menemukan link aslinya (1 kredit Serper)."""
+    from difflib import SequenceMatcher
+    ck = ("serper", title, media)
+    if ck in cache:
+        return cache[ck]
+    try:
+        r = requests.post("https://google.serper.dev/search",
+                          headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                          json={"q": f'"{title}"', "gl": "id", "hl": "id", "num": 10}, timeout=30)
+        items = r.json().get("organic", []) if r.status_code == 200 else []
+    except Exception:
+        return ""
+    want = _norm(title)
+    media_words = [w for w in _norm(media).replace(" com", "").split() if len(w) > 2]
+    best, best_score = "", 0.0
+    for it in items:
+        raw = re.sub(r"\s*(\.\.\.|…)\s*$", "", it.get("title", ""))
+        raw = re.sub(r"\s+[-|–]\s+[^-|–]{2,40}$", "", raw)  # buang " - NamaMedia" di akhir judul
+        got = _norm(raw)
+        n = min(len(got), len(want))
+        score = SequenceMatcher(None, want[:n], got[:n]).ratio() if n >= 15 else 0
+        link = it.get("link", "")
+        if media_words and any(w in link.lower() for w in media_words):
+            score += 0.1  # domain cocok dengan nama media
+        if score > best_score:
+            best, best_score = link, score
+    if best_score >= 0.8:
+        cache[ck] = best
+        return best
+    return ""
+
+
+def resolve_all(articles: list[dict], serper_key: str = "") -> list[dict]:
+    """Isi link_asli untuk tiap berita. Urutan: link asli dari Serper → decoder → cari judul via Serper."""
+    cache = _link_cache()  # diambil di thread utama, dipakai bersama oleh thread pekerja
+
+    def one(a):
+        if a.get("link_asli") and not is_gnews(a["link_asli"]):
+            return a["link_asli"]
+        if not is_gnews(a["link"]):
+            return a["link"]
+        url = resolve_url(a["link"], cache)
+        if is_gnews(url) and serper_key:
+            url = serper_find_link(a["judul"], a.get("media", ""), serper_key, cache) or url
+        return url
     with ThreadPoolExecutor(max_workers=5) as pool:
-        urls = list(pool.map(lambda a: resolve_url(a["link"]), articles))
+        urls = list(pool.map(one, articles))
     return [dict(a, link_asli=u) for a, u in zip(articles, urls)]
 
 
@@ -424,7 +497,7 @@ Hanya gunakan informasi dari daftar di atas, jangan menambah fakta dari luar."""
 # 3. Tampilan
 # ---------------------------------------------------------------------------
 st.title("📰 Media Monitoring")
-st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 18-Okt-2026c (Salin & CSV link)")
+st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 18-Okt-2026d (perbaikan link asli)")
 
 def get_secret(name: str) -> str:
     try:
@@ -580,7 +653,7 @@ if articles is not None:
                 st.warning("Pilih minimal satu berita.")
             else:
                 with st.spinner(f"Mengambil link asli {len(chosen)} berita..."):
-                    chosen = resolve_all(chosen)
+                    chosen = resolve_all(chosen, serper_key)
                 note = ""
                 if add_note:
                     with st.spinner("AI menyiapkan catatan..."):
@@ -634,7 +707,7 @@ if articles is not None:
         st.divider()
         if st.button("📄 Siapkan CSV (dengan link asli berita)", width="stretch"):
             with st.spinner(f"Mengambil link asli {len(articles)} berita..."):
-                resolved = resolve_all(articles)
+                resolved = resolve_all(articles, serper_key)
             st.session_state.csv_data = build_csv(resolved)
         if st.session_state.get("csv_data"):
             st.download_button("⬇️ Unduh daftar berita (.csv)", st.session_state.csv_data,
