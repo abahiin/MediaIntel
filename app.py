@@ -7,6 +7,8 @@ Media Monitoring MVP
 
 import html
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
@@ -46,20 +48,38 @@ def clean_html(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", text or "")).strip()
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def search_news(keyword: str, start: date, end: date, lang: str) -> list[dict]:
+def fetch_feed_entries(keyword: str, day: date, lang: str) -> list:
+    """Ambil berita untuk SATU hari (Google News membatasi ±100 hasil per pencarian)."""
     hl, gl, ceid = ("id", "ID", "ID:id") if lang == "Indonesia" else ("en-US", "US", "US:en")
     url = (
         "https://news.google.com/rss/search?q="
-        + quote_plus(build_query(keyword, start, end))
+        + quote_plus(build_query(keyword, day, day))
         + f"&hl={hl}&gl={gl}&ceid={ceid}"
     )
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    feed = feedparser.parse(resp.content)
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            return feedparser.parse(resp.content).entries
+        except Exception:
+            if attempt == 2:
+                return []
+            time.sleep(1.5 * (attempt + 1))
+    return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def search_news(keyword: str, start: date, end: date, lang: str) -> list[dict]:
+    # Pecah per hari supaya tidak terpotong di 100 hasil. Mulai 1 hari lebih awal
+    # karena Google memakai batas hari UTC, sedangkan kita memakai WIB.
+    days = [start - timedelta(days=1) + timedelta(days=i) for i in range((end - start).days + 2)]
+    entries = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for chunk in pool.map(lambda d: fetch_feed_entries(keyword, d, lang), days):
+            entries.extend(chunk)
 
     results, seen = [], set()
-    for e in feed.entries:
+    for e in entries:
         try:
             published = parsedate_to_datetime(e.get("published", ""))
         except Exception:
@@ -86,10 +106,218 @@ def search_news(keyword: str, start: date, end: date, lang: str) -> list[dict]:
                 "media": source,
                 "cuplikan": clean_html(e.get("summary", "")),
                 "link": e.get("link", ""),
+                "sumber": "Google News",
             }
         )
     results.sort(key=lambda r: r["tanggal"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return results
+
+
+# --- Sumber tambahan: Google Search via Serper.dev (opsional, berbayar per kredit) ---
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+MONTHS.update({"mei": 5, "agu": 8, "okt": 10, "des": 12})
+
+
+def parse_serper_date(text: str):
+    """Serper memberi tanggal seperti 'Oct 12, 2026', '12 Okt 2026' atau '3 days ago'."""
+    if not text:
+        return None
+    t = text.lower().replace(",", "").strip()
+    now = datetime.now(timezone(timedelta(hours=7)))
+    m = re.match(r"(\d+)\s+(minute|hour|day|week|menit|jam|hari|minggu)", t)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = {"minute": "minutes", "menit": "minutes", "hour": "hours", "jam": "hours",
+                 "day": "days", "hari": "days", "week": "weeks", "minggu": "weeks"}[unit]
+        return now - timedelta(**{delta: n})
+    parts = t.split()
+    try:
+        if parts[0][:3] in MONTHS:  # Oct 12 2026
+            return datetime(int(parts[2]), MONTHS[parts[0][:3]], int(parts[1]), tzinfo=now.tzinfo)
+        if parts[1][:3] in MONTHS:  # 12 Okt 2026
+            return datetime(int(parts[2]), MONTHS[parts[1][:3]], int(parts[0]), tzinfo=now.tzinfo)
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def search_serper(keyword: str, start: date, end: date, api_key: str, pages: int) -> list[dict]:
+    tbs = f"cdr:1,cd_min:{start:%m/%d/%Y},cd_max:{end:%m/%d/%Y}"
+    out = []
+    for endpoint, label in (("news", "Google Search (News)"), ("search", "Google Search (Web)")):
+        for page in range(1, pages + 1):
+            resp = requests.post(
+                f"https://google.serper.dev/{endpoint}",
+                headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                json={"q": keyword, "gl": "id", "hl": "id", "tbs": tbs, "num": 10, "page": page},
+                timeout=30,
+            )
+            if resp.status_code in (401, 403):
+                raise RuntimeError("API key Serper tidak valid atau kredit habis.")
+            resp.raise_for_status()
+            items = resp.json().get("news" if endpoint == "news" else "organic", [])
+            for it in items:
+                link = it.get("link", "")
+                out.append({
+                    "tanggal": parse_serper_date(it.get("date", "")),
+                    "judul": it.get("title", ""),
+                    "media": it.get("source") or re.sub(r"^https?://(www\.)?([^/]+).*", r"\2", link),
+                    "cuplikan": it.get("snippet", ""),
+                    "link": link,
+                    "sumber": label,
+                })
+            if len(items) < 10:
+                break
+    return out
+
+
+def merge_results(*lists: list[dict]) -> list[dict]:
+    merged, seen = [], set()
+    for lst in lists:
+        for r in lst:
+            key = re.sub(r"\W+", " ", r["judul"].lower()).strip()
+            if not key or key in seen or r["link"] in seen:
+                continue
+            seen.update({key, r["link"]})
+            merged.append(r)
+    merged.sort(key=lambda r: r["tanggal"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return merged
+
+
+# --- Filter relevansi: pastikan berita benar-benar memuat keyword ---
+def parse_keyword(q: str):
+    """Aturan keyword:
+      - koma ( , ), plus ( + ), titik koma ( ; ) atau OR  -> pemisah ALTERNATIF (salah satu cukup)
+      - spasi di dalam satu alternatif                      -> semua kata harus ada (urutan bebas)
+      - "tanda kutip"                                       -> frasa persis
+      - kata*                                               -> awalan kata (invest* = investment, investments, ...)
+      - -kata                                               -> buang berita yang memuat kata ini
+    Hasil: (alts, excludes). alts = daftar alternatif, tiap alternatif = daftar term yang wajib ada.
+    Contoh: 'IIM + Insight Invest* Management, "korporasi" Taspen -jasindo'
+      -> alts [["iim"], ["insight", "invest*", "management"], ["korporasi", "taspen"]], excludes ["jasindo"]"""
+    tokens = re.findall(r'-?"[^"]*"|[,;+|\n]|[^\s,;+|"]+', q)
+    alts, current, excludes = [], [], []
+    for tok in tokens:
+        if tok in {",", ";", "+", "|", "\n"} or tok.upper() == "OR":
+            if current:
+                alts.append(current)
+            current = []
+            continue
+        neg = tok.startswith("-") and len(tok) > 1
+        term = (tok[1:] if neg else tok).strip('"').lower().strip()
+        if not term or ":" in term:  # abaikan operator seperti site:
+            continue
+        (excludes if neg else current).append(term)
+    if current:
+        alts.append(current)
+    return alts, excludes
+
+
+def alt_to_query(alt: list[str], excludes: list[str]) -> str:
+    """Satu alternatif -> query Google."""
+    clean = [t.replace("*", "") for t in alt]  # Google tidak mengenal awalan*
+    parts = [f'"{t}"' if " " in t else t for t in clean if t]
+    parts += [f'-"{t}"' if " " in t else f"-{t}" for t in excludes]
+    return " ".join(parts)
+
+
+def term_pattern(term: str) -> re.Pattern:
+    words = [w for w in re.split(r"[^\w*]+", term) if w.strip("*")]
+    pats = [re.escape(w.rstrip("*")) + (r"\w*" if w.endswith("*") else "") for w in words]
+    # kata dalam frasa boleh dipisah spasi/tanda baca; pakai batas kata
+    return re.compile(r"(?<!\w)" + r"[\W_]+".join(pats) + r"(?!\w)", re.IGNORECASE)
+
+
+def matches_keyword(text: str, alts, excludes) -> bool:
+    if any(term_pattern(t).search(text) for t in excludes):
+        return False
+    return any(all(term_pattern(t).search(text) for t in alt) for alt in alts)
+
+
+SOCIAL_DOMAINS = ("facebook.com", "instagram.com", "threads.com", "threads.net", "tiktok.com",
+                  "twitter.com", "x.com", "youtube.com", "linkedin.com", "pinterest.com")
+
+
+def is_social(link: str) -> bool:
+    host = re.sub(r"^https?://(www\.|m\.)?([^/]+).*", r"\2", link or "").lower()
+    return any(host == d or host.endswith("." + d) for d in SOCIAL_DOMAINS)
+
+
+def filter_relevant(articles, keyword, check_fulltext=False, max_check=60):
+    clauses, excludes = parse_keyword(keyword)
+    if not clauses:
+        return articles, []
+    keep, drop = [], []
+    for a in articles:
+        (keep if matches_keyword(f"{a['judul']} {a['cuplikan']}", clauses, excludes) else drop).append(a)
+    # Opsional: cek isi artikel untuk yang tidak lolos di judul/cuplikan
+    if check_fulltext and FULLTEXT_AVAILABLE and drop:
+        to_check, rest = drop[:max_check], drop[max_check:]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            bodies = list(pool.map(lambda a: fetch_fulltext(a["link"]), to_check))
+        drop = rest
+        for a, body in zip(to_check, bodies):
+            if body and matches_keyword(f"{a['judul']} {body}", clauses, excludes):
+                keep.append(dict(a, isi=body))
+            else:
+                drop.append(a)
+        keep.sort(key=lambda r: r["tanggal"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return keep, drop
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def resolve_url(link: str) -> str:
+    """Ubah link perantara news.google.com menjadi link asli media."""
+    if "news.google.com" not in link or not FULLTEXT_AVAILABLE:
+        return link
+    for attempt in range(2):
+        try:
+            decoded = gnewsdecoder(link, interval=1)
+            if decoded.get("status") and decoded.get("decoded_url"):
+                return decoded["decoded_url"]
+        except Exception:
+            pass
+        time.sleep(1)
+    return link
+
+
+def resolve_all(articles: list[dict]) -> list[dict]:
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        urls = list(pool.map(lambda a: resolve_url(a["link"]), articles))
+    return [dict(a, link_asli=u) for a, u in zip(articles, urls)]
+
+
+def build_wa_report(articles: list[dict], header: str = "", note: str = "") -> str:
+    """Format laporan WhatsApp: '1. Judul' lalu link di baris berikutnya, dipisah baris kosong."""
+    parts = []
+    if header.strip():
+        parts.append(header.strip())
+    if note.strip():
+        parts.append(note.strip())
+    for i, a in enumerate(articles, 1):
+        parts.append(f"{i}. {a['judul'].strip()}\n{a.get('link_asli') or a['link']}")
+    return "\n\n".join(parts)
+
+
+def analyst_note(keyword: str, articles: list[dict], api_key: str, model: str) -> str:
+    """Catatan singkat dari AI: inti berita + perbedaan angka/fakta antar media."""
+    client = anthropic.Anthropic(api_key=api_key)
+    daftar = "\n".join(f"{i}. {a['judul']} ({a['media']})" for i, a in enumerate(articles, 1))
+    prompt = f"""Kamu analis media monitoring. Berikut judul-judul berita hari ini untuk keyword "{keyword}":
+
+{daftar}
+
+Tulis catatan untuk klien, untuk ditaruh di atas daftar berita di WhatsApp:
+- Baris pertama diawali "*Catatan:*" lalu 1-2 kalimat inti pemberitaan.
+- Jika ada angka/fakta yang berbeda antar media (misal nominal berbeda), tambahkan satu baris
+  "⚠️ Perbedaan data:" yang menyebut perbedaannya dan nomor berita [n]. Jika tidak ada, jangan tulis baris ini.
+- Maksimal 4 baris. Bahasa Indonesia formal. Format WhatsApp (*tebal*), tanpa markdown lain.
+- Hanya berdasarkan judul di atas, jangan menambah fakta."""
+    msg = client.messages.create(model=model, max_tokens=400,
+                                 messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -98,8 +326,11 @@ def fetch_fulltext(gnews_url: str) -> str:
     if not FULLTEXT_AVAILABLE:
         return ""
     try:
-        decoded = gnewsdecoder(gnews_url, interval=1)
-        real_url = decoded.get("decoded_url") if decoded.get("status") else None
+        if "news.google.com" in gnews_url:
+            decoded = gnewsdecoder(gnews_url, interval=1)
+            real_url = decoded.get("decoded_url") if decoded.get("status") else None
+        else:
+            real_url = gnews_url
         if not real_url:
             return ""
         downloaded = trafilatura.fetch_url(real_url)
@@ -150,65 +381,186 @@ Hanya gunakan informasi dari daftar di atas, jangan menambah fakta dari luar."""
 # 3. Tampilan
 # ---------------------------------------------------------------------------
 st.title("📰 Media Monitoring")
-st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya.")
+st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 18-Okt-2026 (Laporan WhatsApp)")
 
-try:
-    secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-except Exception:  # belum ada file secrets
-    secret_key = ""
+def get_secret(name: str) -> str:
+    try:
+        return st.secrets.get(name, "")
+    except Exception:  # belum ada file secrets
+        return ""
 
-with st.sidebar:
-    st.header("Pengaturan")
-    api_key = secret_key or st.text_input("Anthropic API key", type="password",
-                                          help="Diperlukan untuk fitur ringkasan.")
-    model = st.text_input("Model", value=DEFAULT_MODEL)
-    lang = st.selectbox("Edisi berita", ["Indonesia", "Internasional (English)"])
-    max_articles = st.slider("Maks. artikel diringkas", 5, 50, 25)
-    use_fulltext = st.checkbox(
-        "Ambil isi artikel lengkap (lebih akurat, lebih lambat)",
-        value=False, disabled=not FULLTEXT_AVAILABLE,
-    )
 
-keyword = st.text_input("Keyword", placeholder='mis. "Bank Indonesia" suku bunga')
+secret_key = get_secret("ANTHROPIC_API_KEY")
+serper_secret = get_secret("SERPER_API_KEY")
+
+keyword = st.text_input(
+    "Keyword", placeholder="mis. IIM, Insight Invest* Management, korporasi Taspen",
+    help=("**Koma / +** = salah satu cukup (tiap nama dicari terpisah lalu digabung).  \n"
+          "**Spasi** = semua kata harus ada.  \n"
+          '**"tanda kutip"** = frasa persis.  \n'
+          "**kata\\*** = awalan (invest\\* → investment, investments).  \n"
+          "**-kata** = buang berita yang memuat kata ini."))
 c1, c2 = st.columns(2)
 today = date.today()
 start = c1.date_input("Dari tanggal", value=today - timedelta(days=7), max_value=today)
 end = c2.date_input("Sampai tanggal", value=today, max_value=today)
 
-if st.button("🔍 Cari berita", type="primary", use_container_width=True):
+# Pengaturan di halaman utama (sidebar tersembunyi di HP)
+with st.expander("⚙️ Pengaturan sumber & ringkasan", expanded=False):
+    serper_key = serper_secret or st.text_input(
+        "Serper API key (opsional)", type="password",
+        help="Tambahkan hasil Google Search (web + tab News).")
+    api_key = secret_key or st.text_input("Anthropic API key", type="password",
+                                          help="Diperlukan untuk fitur ringkasan.")
+    serper_pages = st.slider("Halaman Google Search", 1, 10, 5,
+                             help="1 halaman = 10 hasil = 1 kredit Serper, untuk web dan news masing-masing.")
+    lang = st.selectbox("Edisi Google News", ["Indonesia", "Internasional (English)"])
+    max_articles = st.slider("Maks. artikel diringkas", 5, 50, 25)
+    use_fulltext = st.checkbox(
+        "Ambil isi artikel lengkap (lebih akurat, lebih lambat)",
+        value=False, disabled=not FULLTEXT_AVAILABLE,
+    )
+    model = st.text_input("Model", value=DEFAULT_MODEL)
+
+_alts, _exc = parse_keyword(keyword)
+if len(_alts) > 1 or _exc:
+    st.caption("Dicari sebagai: " + "  **atau**  ".join(
+        " + ".join(f"`{t}`" for t in a) for a in _alts)
+        + ("  ·  kecuali " + ", ".join(f"`{t}`" for t in _exc) if _exc else ""))
+
+use_serper = st.toggle("Sertakan Google Search (Serper)", value=bool(serper_key), disabled=not serper_key)
+include_social = st.toggle("Sertakan media sosial (Facebook, Instagram, TikTok, X, dll.)", value=False)
+strict = st.toggle("Hanya berita yang memuat keyword", value=True,
+                   help="Buang hasil yang keyword-nya tidak muncul di judul atau cuplikan.")
+deep_check = st.toggle("Cek juga isi artikel (lebih lambat)", value=False,
+                       disabled=not (strict and FULLTEXT_AVAILABLE),
+                       help="Berita yang keyword-nya hanya ada di badan artikel tetap ikut. Maks. 60 artikel dicek.")
+st.caption(
+    ("✅ Serper aktif" if serper_key else "⚪ Serper belum diisi")
+    + " · "
+    + ("✅ Ringkasan aktif" if api_key else "⚪ Ringkasan belum aktif (API key Anthropic kosong)")
+)
+
+if st.button("🔍 Cari berita", type="primary", width="stretch"):
     if not keyword.strip():
         st.warning("Isi keyword dulu.")
         st.stop()
     if start > end:
         st.warning("Tanggal awal harus sebelum tanggal akhir.")
         st.stop()
-    with st.spinner("Mencari berita..."):
-        try:
-            st.session_state.articles = search_news(keyword.strip(), start, end, lang)
-            st.session_state.meta = (keyword.strip(), start, end)
-            st.session_state.summary = None
-        except Exception as ex:
-            st.error(f"Gagal mengambil berita: {ex}")
-            st.stop()
+    if (end - start).days > 92:
+        st.warning("Rentang maksimal 3 bulan per pencarian, supaya tidak diblokir Google.")
+        st.stop()
+    alts, excludes = parse_keyword(keyword)
+    if not alts:
+        st.warning("Keyword tidak terbaca. Contoh: IIM, Insight Investments Management")
+        st.stop()
+    queries = [alt_to_query(a, excludes) for a in alts]
+    gnews, serper = [], []
+    for qi, q in enumerate(queries, 1):
+        with st.spinner(f"Google News: '{q}' ({qi}/{len(queries)})..."):
+            try:
+                gnews += search_news(q, start, end, lang)
+            except Exception as ex:
+                st.error(f"Gagal mengambil Google News untuk '{q}': {ex}")
+        if use_serper:
+            with st.spinner(f"Google Search: '{q}' ({qi}/{len(queries)})..."):
+                try:
+                    serper += search_serper(q, start, end, serper_key, serper_pages)
+                except Exception as ex:
+                    st.error(f"Gagal mengambil Google Search untuk '{q}': {ex}")
+    merged = merge_results(gnews, serper)
+    social = [a for a in merged if is_social(a["link"])]
+    if not include_social:
+        merged = [a for a in merged if not is_social(a["link"])]
+    filtered_out = []
+    if strict:
+        with st.spinner("Menyaring berita yang memuat keyword..."):
+            merged, filtered_out = filter_relevant(merged, keyword.strip(), check_fulltext=deep_check)
+    st.session_state.social_removed = 0 if include_social else len(social)
+    st.session_state.articles = merged
+    st.session_state.filtered_out = filtered_out
+    st.session_state.meta = (keyword.strip(), start, end)
+    st.session_state.summary = None
+    st.session_state.wa_report = None
 
 articles = st.session_state.get("articles")
 if articles is not None:
     kw, s, e = st.session_state.meta
+    filtered_out = st.session_state.get("filtered_out", [])
     if not articles:
-        st.info("Tidak ada berita ditemukan untuk keyword dan periode ini.")
+        st.info("Tidak ada berita yang memuat keyword ini pada periode tersebut."
+                + (f" ({len(filtered_out)} hasil Google disaring; matikan filter untuk melihatnya.)"
+                   if filtered_out else ""))
         st.stop()
+    if filtered_out:
+        st.caption(f"🧹 {len(filtered_out)} hasil Google disaring karena tidak memuat keyword "
+                   "(lihat di tab Daftar berita).")
+    if st.session_state.get("social_removed"):
+        st.caption(f"📵 {st.session_state.social_removed} hasil media sosial tidak ditampilkan.")
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Jumlah berita", len(articles))
     m2.metric("Jumlah media", len({a["media"] for a in articles}))
     m3.metric("Periode", f"{(e - s).days + 1} hari")
 
-    tab_sum, tab_list, tab_chart = st.tabs(["🧠 Ringkasan", "📄 Daftar berita", "📊 Statistik"])
+    tab_wa, tab_sum, tab_list, tab_chart = st.tabs(
+        ["💬 Laporan WhatsApp", "🧠 Ringkasan", "📄 Daftar berita", "📊 Statistik"])
+
+    with tab_wa:
+        st.caption("Centang berita yang masuk laporan, lalu klik Susun laporan. "
+                   "Urutan mengikuti tabel (terbaru di atas).")
+        table = pd.DataFrame({
+            "Kirim": True,
+            "Judul": [a["judul"] for a in articles],
+            "Media": [a["media"] for a in articles],
+            "Waktu": [a["tanggal"].astimezone(timezone(timedelta(hours=7))).strftime("%d/%m %H:%M")
+                      if a["tanggal"] else "-" for a in articles],
+        })
+        edited = st.data_editor(
+            table, hide_index=True, width="stretch",
+            key=f"wa_{kw}_{s}_{e}_{len(articles)}",
+            column_config={"Kirim": st.column_config.CheckboxColumn(width="small"),
+                           "Judul": st.column_config.TextColumn(width="large")},
+            disabled=["Media", "Waktu"],
+        )
+        header = st.text_input("Judul laporan (opsional)",
+                               placeholder=f"mis. Media Monitoring {kw} – {date.today():%d/%m/%Y} Pagi")
+        add_note = st.checkbox("Tambahkan catatan analis dari AI (inti berita + perbedaan data antar media)",
+                               value=False, disabled=not (anthropic and api_key))
+
+        if st.button("📝 Susun laporan", type="primary", width="stretch"):
+            chosen = [dict(a, judul=edited.loc[i, "Judul"])  # judul boleh diedit reviewer
+                      for i, a in enumerate(articles) if edited.loc[i, "Kirim"]]
+            if not chosen:
+                st.warning("Pilih minimal satu berita.")
+            else:
+                with st.spinner(f"Mengambil link asli {len(chosen)} berita..."):
+                    chosen = resolve_all(chosen)
+                note = ""
+                if add_note:
+                    with st.spinner("AI menyiapkan catatan..."):
+                        try:
+                            note = analyst_note(kw, chosen, api_key, model)
+                        except Exception as ex:
+                            st.error(f"Catatan AI gagal dibuat: {ex}")
+                st.session_state.wa_report = build_wa_report(chosen, header, note)
+                st.session_state.wa_unresolved = sum("news.google.com" in c["link_asli"] for c in chosen)
+
+        if st.session_state.get("wa_report"):
+            report = st.session_state.wa_report
+            if st.session_state.get("wa_unresolved"):
+                st.warning(f"{st.session_state.wa_unresolved} link belum berhasil diubah ke link asli "
+                           "(masih news.google.com). Link tetap bisa dibuka, atau klik Susun laporan lagi.")
+            st.code(report, language=None, wrap_lines=True)
+            st.caption("Klik ikon salin di pojok kanan atas kotak, lalu tempel di WhatsApp.")
+            st.link_button("📲 Buka di WhatsApp", "https://wa.me/?text=" + quote_plus(report),
+                           width="stretch")
 
     with tab_sum:
         if anthropic is None or not api_key:
-            st.info("Masukkan Anthropic API key di sidebar untuk membuat ringkasan.")
-        elif st.button("Buat ringkasan", use_container_width=True):
+            st.info("Isi Anthropic API key (di Secrets atau di Pengaturan) untuk membuat ringkasan.")
+        elif st.button("Buat ringkasan", width="stretch"):
             subset = [dict(a) for a in articles[:max_articles]]
             if use_fulltext:
                 prog = st.progress(0.0, text="Mengambil isi artikel...")
@@ -229,8 +581,13 @@ if articles is not None:
     with tab_list:
         for i, a in enumerate(articles, 1):
             tgl = a["tanggal"].strftime("%d %b %Y %H:%M") if a["tanggal"] else "-"
-            st.markdown(f"**{i}. [{a['judul']}]({a['link']})**  \n{a['media']} · {tgl}")
-        df = pd.DataFrame(articles)
+            st.markdown(f"**{i}. [{a['judul']}]({a['link']})**  \n{a['media']} · {tgl} · _{a['sumber']}_")
+        if filtered_out:
+            with st.expander(f"🧹 Disaring — tidak memuat keyword ({len(filtered_out)})"):
+                for a in filtered_out:
+                    tgl = a["tanggal"].strftime("%d %b %Y") if a["tanggal"] else "-"
+                    st.markdown(f"- [{a['judul']}]({a['link']}) · {a['media']} · {tgl}")
+        df = pd.DataFrame(articles).drop(columns=["isi"], errors="ignore")
         df["tanggal"] = df["tanggal"].astype(str)
         st.download_button("⬇️ Unduh daftar berita (.csv)", df.to_csv(index=False).encode("utf-8"),
                            file_name=f"berita_{kw}_{s}_{e}.csv", mime="text/csv")
