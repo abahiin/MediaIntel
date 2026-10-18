@@ -301,6 +301,49 @@ def build_wa_report(articles: list[dict], header: str = "", note: str = "") -> s
     return "\n\n".join(parts)
 
 
+def build_csv(articles: list[dict]) -> bytes:
+    rows = [{
+        "No": i,
+        "Tanggal": a["tanggal"].astimezone(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M")
+                   if a["tanggal"] else "",
+        "Media": a["media"],
+        "Judul Berita": a["judul"],
+        "Link Berita": a.get("link_asli") or a["link"],
+        "Cuplikan": a.get("cuplikan", ""),
+        "Sumber Pencarian": a.get("sumber", ""),
+    } for i, a in enumerate(articles, 1)]
+    # utf-8-sig supaya huruf/tanda baca terbaca benar saat dibuka di Excel
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+
+def copy_button(text: str, label: str):
+    """Tombol salin ke clipboard (bekerja di HP dan laptop)."""
+    import json
+    payload = json.dumps(text).replace("</", "<\\/")
+    page = f"""<meta charset="utf-8">
+<button id="b" style="width:100%;padding:12px;font-size:16px;border:none;border-radius:8px;
+  background:#25D366;color:#fff;font-weight:600;cursor:pointer;font-family:sans-serif">{html.escape(label)}</button>
+<script>
+const t = {payload};
+const b = document.getElementById("b");
+b.onclick = async () => {{
+  let ok = false;
+  try {{ await navigator.clipboard.writeText(t); ok = true; }} catch (e) {{}}
+  if (!ok) {{
+    const ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta);
+    ta.select(); try {{ ok = document.execCommand("copy"); }} catch (e) {{}} ta.remove();
+  }}
+  b.textContent = ok ? "✅ Tersalin, silakan tempel di WhatsApp" : "⚠️ Gagal, pakai ikon salin di kotak teks";
+  setTimeout(() => b.textContent = {json.dumps(label)}, 3000);
+}};
+</script>"""
+    if hasattr(st, "iframe"):          # Streamlit baru
+        st.iframe(page, height=56)
+    else:                              # Streamlit lama
+        import streamlit.components.v1 as components
+        components.html(page, height=56)
+
+
 def analyst_note(keyword: str, articles: list[dict], api_key: str, model: str) -> str:
     """Catatan singkat dari AI: inti berita + perbedaan angka/fakta antar media."""
     client = anthropic.Anthropic(api_key=api_key)
@@ -381,7 +424,7 @@ Hanya gunakan informasi dari daftar di atas, jangan menambah fakta dari luar."""
 # 3. Tampilan
 # ---------------------------------------------------------------------------
 st.title("📰 Media Monitoring")
-st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 18-Okt-2026 (Laporan WhatsApp)")
+st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 18-Okt-2026c (Salin & CSV link)")
 
 def get_secret(name: str) -> str:
     try:
@@ -483,6 +526,7 @@ if st.button("🔍 Cari berita", type="primary", width="stretch"):
     st.session_state.meta = (keyword.strip(), start, end)
     st.session_state.summary = None
     st.session_state.wa_report = None
+    st.session_state.csv_data = None
 
 articles = st.session_state.get("articles")
 if articles is not None:
@@ -552,10 +596,10 @@ if articles is not None:
             if st.session_state.get("wa_unresolved"):
                 st.warning(f"{st.session_state.wa_unresolved} link belum berhasil diubah ke link asli "
                            "(masih news.google.com). Link tetap bisa dibuka, atau klik Susun laporan lagi.")
+            copy_button(report, "📋 Salin laporan")
             st.code(report, language=None, wrap_lines=True)
-            st.caption("Klik ikon salin di pojok kanan atas kotak, lalu tempel di WhatsApp.")
-            st.link_button("📲 Buka di WhatsApp", "https://wa.me/?text=" + quote_plus(report),
-                           width="stretch")
+            st.caption("Klik Salin laporan, lalu tempel (paste) di chat WhatsApp klien. "
+                       "Kalau tombol tidak berfungsi, pakai ikon salin di pojok kanan atas kotak teks.")
 
     with tab_sum:
         if anthropic is None or not api_key:
@@ -587,10 +631,14 @@ if articles is not None:
                 for a in filtered_out:
                     tgl = a["tanggal"].strftime("%d %b %Y") if a["tanggal"] else "-"
                     st.markdown(f"- [{a['judul']}]({a['link']}) · {a['media']} · {tgl}")
-        df = pd.DataFrame(articles).drop(columns=["isi"], errors="ignore")
-        df["tanggal"] = df["tanggal"].astype(str)
-        st.download_button("⬇️ Unduh daftar berita (.csv)", df.to_csv(index=False).encode("utf-8"),
-                           file_name=f"berita_{kw}_{s}_{e}.csv", mime="text/csv")
+        st.divider()
+        if st.button("📄 Siapkan CSV (dengan link asli berita)", width="stretch"):
+            with st.spinner(f"Mengambil link asli {len(articles)} berita..."):
+                resolved = resolve_all(articles)
+            st.session_state.csv_data = build_csv(resolved)
+        if st.session_state.get("csv_data"):
+            st.download_button("⬇️ Unduh daftar berita (.csv)", st.session_state.csv_data,
+                               file_name=f"berita_{kw}_{s}_{e}.csv", mime="text/csv", width="stretch")
 
     with tab_chart:
         df = pd.DataFrame(articles).dropna(subset=["tanggal"])
