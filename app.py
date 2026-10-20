@@ -142,28 +142,88 @@ def parse_serper_date(text: str):
     return None
 
 
+def date_from_url(link: str):
+    """Banyak media menaruh tanggal di URL: /2026/10/08/ atau /20261008..."""
+    m = re.search(r"/(20\d\d)[/-](0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])(?:/|-|$)", link or "")
+    if not m:
+        m = re.search(r"/(20\d\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{4,}", link or "")
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), 12,
+                            tzinfo=timezone(timedelta(hours=7)))
+        except ValueError:
+            return None
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def date_from_page(link: str):
+    """Ambil tanggal terbit dari metadata halaman berita (best effort)."""
+    if not FULLTEXT_AVAILABLE or is_gnews(link):
+        return None
+    try:
+        meta = trafilatura.extract_metadata(trafilatura.fetch_url(link))
+        if meta and meta.date:
+            y, mo, d = (int(x) for x in meta.date[:10].split("-"))
+            return datetime(y, mo, d, 12, tzinfo=timezone(timedelta(hours=7)))
+    except Exception:
+        pass
+    return None
+
+
+def fill_dates(articles: list[dict], start: date, end: date, max_check: int = 40):
+    """Lengkapi tanggal yang kosong, lalu buang yang jelas di luar periode."""
+    missing = [a for a in articles if not a["tanggal"]][:max_check]
+    if missing:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for a, dt in zip(missing, pool.map(lambda a: date_from_page(a["link"]), missing)):
+                a["tanggal"] = dt
+    wib = timezone(timedelta(hours=7))
+    keep, out = [], 0
+    for a in articles:
+        if a["tanggal"] and not (start <= a["tanggal"].astimezone(wib).date() <= end):
+            out += 1
+            continue
+        keep.append(a)
+    return keep, out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def search_serper(keyword: str, start: date, end: date, api_key: str, pages: int) -> list[dict]:
+def search_serper(keyword: str, start: date, end: date, api_key: str, pages: int,
+                  images: bool = True) -> list[dict]:
     tbs = f"cdr:1,cd_min:{start:%m/%d/%Y},cd_max:{end:%m/%d/%Y}"
     out = []
-    for endpoint, label in (("news", "Google Search (News)"), ("search", "Google Search (Web)")):
-        for page in range(1, pages + 1):
+    endpoints = [("news", "Google Search (News)"), ("search", "Google Search (Web)")]
+    if images:  # banyak media kecil hanya muncul di tab Images
+        endpoints.append(("images", "Google Images"))
+    for endpoint, label in endpoints:
+        for page in range(1, (min(pages, 3) if endpoint == "images" else pages) + 1):
             resp = requests.post(
                 f"https://google.serper.dev/{endpoint}",
                 headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
                 json={"q": keyword, "gl": "id", "hl": "id", "tbs": tbs, "num": 10, "page": page},
                 timeout=30,
             )
-            if resp.status_code in (401, 403):
-                raise RuntimeError("API key Serper tidak valid atau kredit habis.")
+            if resp.status_code in (400, 401, 402, 403, 429):
+                try:
+                    reason = resp.json().get("message") or resp.text
+                except Exception:
+                    reason = resp.text
+                reason = (reason or "").strip()[:200]
+                hint = ("kredit Serper habis, cek dashboard serper.dev" if re.search(r"credit|quota|balance", reason, re.I)
+                        else "API key Serper tidak dikenali, cek SERPER_API_KEY di Secrets"
+                        if resp.status_code in (401, 403) else "permintaan ditolak Serper")
+                raise RuntimeError(f"{hint} (kode {resp.status_code}: {reason or 'tanpa keterangan'})")
             resp.raise_for_status()
-            items = resp.json().get("news" if endpoint == "news" else "organic", [])
+            items = resp.json().get({"news": "news", "search": "organic", "images": "images"}[endpoint], [])
             for it in items:
                 link = it.get("link", "")
+                if not link:
+                    continue
                 out.append({
-                    "tanggal": parse_serper_date(it.get("date", "")),
+                    "tanggal": parse_serper_date(it.get("date", "")) or date_from_url(link),
                     "judul": it.get("title", ""),
-                    "media": it.get("source") or re.sub(r"^https?://(www\.)?([^/]+).*", r"\2", link),
+                    "media": it.get("source") or it.get("domain") or re.sub(r"^https?://(www\.)?([^/]+).*", r"\2", link),
                     "cuplikan": it.get("snippet", ""),
                     "link": link,
                     "sumber": label,
@@ -269,7 +329,8 @@ def filter_relevant(articles, keyword, check_fulltext=False, max_check=60):
     if check_fulltext and FULLTEXT_AVAILABLE and drop:
         to_check, rest = drop[:max_check], drop[max_check:]
         with ThreadPoolExecutor(max_workers=8) as pool:
-            bodies = list(pool.map(lambda a: fetch_fulltext(a["link"]), to_check))
+            bodies = list(pool.map(lambda a: fetch_fulltext(
+                a["link_asli"] if a.get("link_asli") and not is_gnews(a["link_asli"]) else a["link"]), to_check))
         drop = rest
         for a, body in zip(to_check, bodies):
             if body and matches_keyword(f"{a['judul']} {body}", clauses, excludes):
@@ -497,7 +558,7 @@ Hanya gunakan informasi dari daftar di atas, jangan menambah fakta dari luar."""
 # 3. Tampilan
 # ---------------------------------------------------------------------------
 st.title("📰 Media Monitoring")
-st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 18-Okt-2026d (perbaikan link asli)")
+st.caption("Cari pemberitaan online berdasarkan keyword dan tanggal, lalu dapatkan ringkasannya. · Versi 19-Okt-2026 (Images + cek isi)")
 
 def get_secret(name: str) -> str:
     try:
@@ -545,12 +606,15 @@ if len(_alts) > 1 or _exc:
         + ("  ·  kecuali " + ", ".join(f"`{t}`" for t in _exc) if _exc else ""))
 
 use_serper = st.toggle("Sertakan Google Search (Serper)", value=bool(serper_key), disabled=not serper_key)
+use_images = st.toggle("Sertakan Google Images (menangkap media kecil)", value=bool(serper_key),
+                       disabled=not (serper_key and use_serper),
+                       help="Banyak portal kecil hanya muncul di tab Images Google. Menambah ±1–3 kredit Serper per nama.")
 include_social = st.toggle("Sertakan media sosial (Facebook, Instagram, TikTok, X, dll.)", value=False)
 strict = st.toggle("Hanya berita yang memuat keyword", value=True,
                    help="Buang hasil yang keyword-nya tidak muncul di judul atau cuplikan.")
-deep_check = st.toggle("Cek juga isi artikel (lebih lambat)", value=False,
+deep_check = st.toggle("Cek juga isi artikel (lebih lambat)", value=True,
                        disabled=not (strict and FULLTEXT_AVAILABLE),
-                       help="Berita yang keyword-nya hanya ada di badan artikel tetap ikut. Maks. 60 artikel dicek.")
+                       help="Berita yang nama kliennya hanya ada di isi artikel (bukan di judul) tetap ikut. Maks. 60 artikel dicek.")
 st.caption(
     ("✅ Serper aktif" if serper_key else "⚪ Serper belum diisi")
     + " · "
@@ -576,16 +640,20 @@ if st.button("🔍 Cari berita", type="primary", width="stretch"):
     for qi, q in enumerate(queries, 1):
         with st.spinner(f"Google News: '{q}' ({qi}/{len(queries)})..."):
             try:
-                gnews += search_news(q, start, end, lang)
+                gnews += [dict(a, kueri=q) for a in search_news(q, start, end, lang)]
             except Exception as ex:
                 st.error(f"Gagal mengambil Google News untuk '{q}': {ex}")
         if use_serper:
             with st.spinner(f"Google Search: '{q}' ({qi}/{len(queries)})..."):
                 try:
-                    serper += search_serper(q, start, end, serper_key, serper_pages)
+                    serper += [dict(a, kueri=q) for a in
+                               search_serper(q, start, end, serper_key, serper_pages, use_images)]
                 except Exception as ex:
                     st.error(f"Gagal mengambil Google Search untuk '{q}': {ex}")
     merged = merge_results(gnews, serper)
+    if any(not a["tanggal"] for a in merged):
+        with st.spinner("Mengecek tanggal terbit berita dari Google Search/Images..."):
+            merged, out_of_range = fill_dates(merged, start, end)
     social = [a for a in merged if is_social(a["link"])]
     if not include_social:
         merged = [a for a in merged if not is_social(a["link"])]
@@ -594,6 +662,7 @@ if st.button("🔍 Cari berita", type="primary", width="stretch"):
         with st.spinner("Menyaring berita yang memuat keyword..."):
             merged, filtered_out = filter_relevant(merged, keyword.strip(), check_fulltext=deep_check)
     st.session_state.social_removed = 0 if include_social else len(social)
+    st.session_state.per_query = {q: sum(1 for a in merged if a.get("kueri") == q) for q in queries}
     st.session_state.articles = merged
     st.session_state.filtered_out = filtered_out
     st.session_state.meta = (keyword.strip(), start, end)
@@ -613,6 +682,9 @@ if articles is not None:
     if filtered_out:
         st.caption(f"🧹 {len(filtered_out)} hasil Google disaring karena tidak memuat keyword "
                    "(lihat di tab Daftar berita).")
+    if st.session_state.get("per_query") and len(st.session_state.per_query) > 1:
+        st.caption("Sumbangan tiap nama: " + " · ".join(
+            f"`{q}` {n}" for q, n in st.session_state.per_query.items()))
     if st.session_state.get("social_removed"):
         st.caption(f"📵 {st.session_state.social_removed} hasil media sosial tidak ditampilkan.")
 
